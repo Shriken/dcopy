@@ -1,0 +1,9 @@
+{
+	"name": "dcopy",
+	"authors": [
+		"Zane Sterling"
+	],
+	"description": "A tool for manipulating disk images",
+	"copyright": "Copyright © 2016, Zane Sterling",
+	"license": "mit"
+}
