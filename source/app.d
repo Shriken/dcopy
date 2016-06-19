@@ -1,9 +1,8 @@
-import STD_ARRAY = std.array;
 import std.getopt;
 import std.stdio;
-import std.string;
 import std.typecons;
 
+import fat12_driver;
 import util;
 
 int main(string[] args) {
@@ -32,7 +31,8 @@ int main(string[] args) {
 		return 1;
 	}
 
-	auto path = args.popFront().formatFilenameToFAT12();
+	auto path = args.popFront().formatFilename();
+	auto fat = Fat12(target);
 
 	return 0;
 }
@@ -42,8 +42,8 @@ int main(string[] args) {
 void openSourceAndTarget(
 	ref string[] names,
 	bool sourceIsStdin,
-	File source,
-	File target
+	out File source,
+	out File target
 ) {
 	// open source and target files
 	if (sourceIsStdin) {
@@ -51,38 +51,7 @@ void openSourceAndTarget(
 	} else {
 		source = File(names.popFront());
 	}
-	target = File(names.popFront(), "w");
-}
-
-// format a filename to fat12
-// trim the name if it's too long
-// extend it with spaces if it's too short
-string formatFilenameToFAT12(string fn) {
-	string ret = fn;
-	auto index = ret.lastIndexOf('.');
-	if (index != ret.length - 3) {
-		if (ret.indexOf('.') == -1) {
-			ret ~= '.';
-			index = ret.length - 1;
-		}
-		ret ~= STD_ARRAY.replicate(" ", 4 - (ret.length - index));
-	}
-
-	if (ret.length > 12) {
-		ret = ret[0..8] ~ '.' ~ ret[$-3..$];
-	} else if (ret.length < 12) {
-		auto separator = ret.lastIndexOf('.');
-		ret = ret[0..separator]
-			~ STD_ARRAY.replicate(" ", 8 - separator)
-			~ '.'
-			~ ret[$-3..$];
-	}
-
-	if (fn != ret) {
-		stderr.writefln("warning: changed fn \"%s\" to \"%s\"", fn, ret);
-	}
-
-	return ret;
+	target = File(names.popFront(), "r+");
 }
 
 void usage(string name) {
