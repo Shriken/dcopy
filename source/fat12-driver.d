@@ -11,8 +11,13 @@ alias ClusterId = ushort;
 alias SectorId = ushort;
 
 struct Fat12 {
-	static SectorId ROOT_DIR_SECTOR = 1 + 9 + 9; // boot sector + FAT1 + FAT2
-	static SectorId FAT1_SECTOR = 1; // just past boot sector
+	static SectorId BOOT_SECTOR = 0;
+	static SectorId FAT1_SECTOR, FAT2_SECTOR, ROOT_DIR_SECTOR;
+	static this() {
+		FAT1_SECTOR = cast(ushort)(BOOT_SECTOR + 1);
+		FAT2_SECTOR = cast(ushort)(FAT1_SECTOR + 9);
+		ROOT_DIR_SECTOR = cast(ushort)(FAT2_SECTOR + 9);
+	}
 
 	File image;
 	ImageConfig config;
@@ -27,9 +32,24 @@ struct Fat12 {
 		return image.rawRead(new ubyte[config.bytesPerSector]);
 	}
 
-	// returns the directory entry of a file with matching filename
-	// note: doesn't support directories
-	DirectoryEntry fileEntry(string fn) {
+	ubyte[] readClusterData(ClusterId clusterNum) {
+		return readSector(cast(ushort)(clusterNum + 33 - 2));
+	}
+
+	ClusterId readFatValue(ClusterId clusterNum) {
+		// 512 / 2 = 256 values per sector, so ignore the last byte
+		auto sector = readSector(FAT1_SECTOR + clusterNum >> 8);
+		// the index within the sector is what we just ignored
+		return sector.getWordAt((clusterNum && 0xff) << 1);
+	}
+
+	/// returns the directory entry of a file with matching filename
+	/// note: doesn't support directories
+	DirectoryEntry fileEntry(string fn)
+	out (entry) {
+		assert(!entry.isFree);
+		assert(!entry.restAreFree);
+	} body {
 		seekSector(ROOT_DIR_SECTOR);
 		auto entryBytes = new ubyte[DirectoryEntry.sizeof];
 		while (true) {
@@ -45,6 +65,15 @@ struct Fat12 {
 			}
 		}
 		throw new Exception("file %s not found", fn);
+	}
+
+	bool fileExists(string fn) {
+		try {
+			fileEntry(fn);
+			return true;
+		} catch {
+			return false;
+		}
 	}
 
 	private void seekSector(SectorId sectorNum) {
@@ -156,11 +185,11 @@ struct DirectoryEntry {
 	ushort firstLogicalCluster;
 	uint fileSize; // in bytes
 
-	@property bool isFree() {
+	@property const bool isFree() {
 		return filename[0] == 0xe5 || filename[0] == 0;
 	}
 
-	@property bool restAreFree() {
+	@property const bool restAreFree() {
 		return filename[0] == 0;
 	}
 
