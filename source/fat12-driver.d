@@ -37,10 +37,28 @@ struct Fat12 {
 	}
 
 	ClusterId readFatValue(ClusterId clusterNum) {
-		// 512 / 2 = 256 values per sector, so ignore the last byte
-		auto sector = readSector(FAT1_SECTOR + clusterNum >> 8);
-		// the index within the sector is what we just ignored
-		return sector.getWordAt((clusterNum && 0xff) << 1);
+		// locate the value
+		auto valueStart = (clusterNum * 3) / 2 // byte offset
+		auto startingSector = 33 + (valueStart >> 9) - 2;
+		auto indexInSector = valueStart % 512;
+
+		// get first and second bytes
+		ushort firstHalf, secondHalf;
+		auto bytes = readSector(startingSector);
+		firstHalf = bytes[indexInSector];
+		if (indexInSector == 511) {
+			bytes = readSector(startingSector + 1);
+			secondHalf = bytes[0];
+		} else {
+			secondHalf = bytes[indexInSector + 1];
+		}
+
+		auto odd = clusterNum % 2 == 1;
+		if (odd) {
+			return ((firstHalf & 0xf0) << 8) | secondHalf;
+		} else {
+			return (firstHalf << 4) | (secondHalf & 0xff);
+		}
 	}
 
 	/// returns the directory entry of a file with matching filename
