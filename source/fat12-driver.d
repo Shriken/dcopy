@@ -1,53 +1,91 @@
 module fat12_driver;
 
-import STD_ARRAY = std.array;
 import std.algorithm.mutation;
 import std.stdio;
-import std.string;
 
 import util;
 
 alias ClusterId = ushort;
 alias SectorId = ushort;
+bool isLastCluster(ClusterId cluster) {
+	return 0xff8 <= cluster && cluster <= 0xfff;
+}
+
+static SectorId BOOT_SECTOR = 0;
+static SectorId FAT1_SECTOR, FAT2_SECTOR, ROOT_DIR_SECTOR;
+static this() {
+	FAT1_SECTOR = cast(ushort)(BOOT_SECTOR + 1);
+	FAT2_SECTOR = cast(ushort)(FAT1_SECTOR + 9);
+	ROOT_DIR_SECTOR = cast(ushort)(FAT2_SECTOR + 9);
+}
 
 struct Fat12 {
-	static SectorId BOOT_SECTOR = 0;
-	static SectorId FAT1_SECTOR, FAT2_SECTOR, ROOT_DIR_SECTOR;
-	static this() {
-		FAT1_SECTOR = cast(ushort)(BOOT_SECTOR + 1);
-		FAT2_SECTOR = cast(ushort)(FAT1_SECTOR + 9);
-		ROOT_DIR_SECTOR = cast(ushort)(FAT2_SECTOR + 9);
-	}
+	Image image;
 
-	File image;
+	this(File f) {
+		image = new Image(f);
+	}
+}
+
+class Image {
+	File file;
 	ImageConfig config;
 
 	this(File f) {
-		image = f;
+		file = f;
 		config = ImageConfig(f);
 	}
 
 	ubyte[] readSector(SectorId sectorNum) {
-		image.seek(sectorNum * config.bytesPerSector);
-		return image.rawRead(new ubyte[config.bytesPerSector]);
+		seekSector(sectorNum);
+		return file.rawRead(new ubyte[config.bytesPerSector]);
 	}
 
-	ubyte[] readClusterData(ClusterId clusterNum) {
-		return readSector(cast(ushort)(clusterNum + 33 - 2));
+	void writeSector(SectorId sectorNum, ubyte[] data)
+	in {
+		assert(data.length <= config.bytesPerSector);
+	} body {
+		seekSector(sectorNum);
+		file.rawWrite(data);
 	}
 
-	ClusterId readFatValue(ClusterId clusterNum) {
+	private void seekSector(SectorId sectorNum) {
+		file.seek(sectorNum * config.bytesPerSector);
+	}
+}
+
+struct Cluster {
+	ClusterId id;
+	ClusterId value;
+	ubyte[512] data;
+
+	private Image image;
+	@property SectorId dataSector() { return cast(ushort)(id + 33 - 2); }
+
+	this(ClusterId id, Image image) {
+		this.image = image;
+		this.id = id;
+		this.value = readFatValue(id);
+		this.data = image.readSector(cast(ushort)(id + 33 - 2));
+	}
+
+	~this() {
+		writeFatValue(value);
+		image.writeSector(dataSector, data);
+	}
+
+	private ClusterId readFatValue(ClusterId clusterNum) {
 		// locate the value
-		auto valueStart = (clusterNum * 3) / 2 // byte offset
+		auto valueStart = (clusterNum * 3) / 2; // byte offset
 		auto startingSector = 33 + (valueStart >> 9) - 2;
 		auto indexInSector = valueStart % 512;
 
 		// get first and second bytes
-		ushort firstHalf, secondHalf;
-		auto bytes = readSector(startingSector);
+		ubyte firstHalf, secondHalf;
+		auto bytes = image.readSector(cast(ushort)startingSector);
 		firstHalf = bytes[indexInSector];
 		if (indexInSector == 511) {
-			bytes = readSector(startingSector + 1);
+			bytes = image.readSector(cast(ushort)(startingSector + 1));
 			secondHalf = bytes[0];
 		} else {
 			secondHalf = bytes[indexInSector + 1];
@@ -61,41 +99,36 @@ struct Fat12 {
 		}
 	}
 
-	/// returns the directory entry of a file with matching filename
-	/// note: doesn't support directories
-	DirectoryEntry fileEntry(string fn)
-	out (entry) {
-		assert(!entry.isFree);
-		assert(!entry.restAreFree);
+	private void writeFatValue(ClusterId value)
+	in {
+		assert(value <= 0xfff);
 	} body {
-		seekSector(ROOT_DIR_SECTOR);
-		auto entryBytes = new ubyte[DirectoryEntry.sizeof];
-		while (true) {
-			auto entry = DirectoryEntry(image.rawRead(entryBytes));
-			if (entry.restAreFree) {
-				break;
-			} else if (entry.isFree) {
-				continue;
-			}
+		// locate the value
+		auto valueStart = (id * 3) / 2; // byte offset
+		auto startingSector = 33 + (valueStart >> 9) - 2;
+		auto indexInSector = valueStart & 0x1f;
 
-			if (entry.filename == fn) {
-				return entry;
-			}
+		auto odd = id % 2 == 1;
+		ubyte firstHalf, secondHalf;
+		auto firstSector = image.readSector(cast(ushort)startingSector);
+		if (odd) {
+			firstHalf = ((value & 0xf) << 4) |
+				(firstSector[indexInSector] & 0xf);
+		} else {
+			firstHalf = value & 0xff;
 		}
-		throw new Exception("file %s not found", fn);
-	}
 
-	bool fileExists(string fn) {
-		try {
-			fileEntry(fn);
-			return true;
-		} catch {
-			return false;
+		ubyte secondByte;
+		if (indexInSector + 1 == firstSector.length) {
+			secondByte = image
+				.readSector(cast(ushort)(startingSector + 1))[0];
+		} else {
+			secondByte = firstSector[indexInSector + 1];
 		}
-	}
+		secondHalf = odd ? (value & 0xff0 >> 4)
+			: ((secondByte & 0xf0) | (value >> 8));
 
-	private void seekSector(SectorId sectorNum) {
-		image.seek(sectorNum * config.bytesPerSector);
+		auto secondSector = image.readSector(cast(ushort)startingSector);
 	}
 }
 
@@ -158,38 +191,10 @@ private uint getDoubleAt(ubyte[] data, size_t index) {
 	);
 }
 
-// format a filename to fat12
-// trim the name if it's too long
-// extend it with spaces if it's too short
-string formatFilename(string fn) {
-	string ret = fn;
-	auto index = ret.lastIndexOf('.');
-	if (index != ret.length - 3) {
-		if (ret.indexOf('.') == -1) {
-			ret ~= '.';
-			index = ret.length - 1;
-		}
-		ret ~= STD_ARRAY.replicate(" ", 4 - (ret.length - index));
-	}
-
-	if (ret.length > 12) {
-		ret = ret[0..8] ~ '.' ~ ret[$-3..$];
-	} else if (ret.length < 12) {
-		auto separator = ret.lastIndexOf('.');
-		ret = ret[0..separator]
-			~ STD_ARRAY.replicate(" ", 8 - separator)
-			~ '.'
-			~ ret[$-3..$];
-	}
-
-	if (fn != ret) {
-		stderr.writefln("warning: changed fn \"%s\" to \"%s\"", fn, ret);
-	}
-
-	return ret;
-}
-
 struct DirectoryEntry {
+	static ubyte FREE_BYTE = 0xe5;
+	static ubyte REST_ARE_FREE_BYTE = 0;
+
 	ubyte[8] filename;
 	ubyte[3] extension;
 	ubyte attributes;
@@ -204,7 +209,7 @@ struct DirectoryEntry {
 	uint fileSize; // in bytes
 
 	@property const bool isFree() {
-		return filename[0] == 0xe5 || filename[0] == 0;
+		return filename[0] == FREE_BYTE || filename[0] == REST_ARE_FREE_BYTE;
 	}
 
 	@property const bool restAreFree() {
@@ -225,7 +230,34 @@ struct DirectoryEntry {
 		firstLogicalCluster = data.getWordAt(26);
 		fileSize = data.getDoubleAt(28); // in bytes
 	}
-}
-unittest {
-	assert(DirectoryEntry.sizeof == 32);
+
+	/+
+	/// returns the directory entry of a file with matching filename
+	/// note: doesn't support directories
+	DirectoryEntry fileEntry(string fn)
+	out (entry) {
+		assert(!entry.isFree);
+		assert(!entry.restAreFree);
+	} body {
+		seekSector(ROOT_DIR_SECTOR);
+		auto entryBytes = new ubyte[DirectoryEntry.sizeof];
+		while (true) {
+			auto entry = DirectoryEntry(file.rawRead(entryBytes));
+			if (entry.restAreFree) {
+				break;
+			} else if (entry.isFree) {
+				continue;
+			}
+
+			if (entry.filename == fn) {
+				return entry;
+			}
+		}
+		throw new Exception("file %s not found", fn);
+	}
+	+/
+
+	unittest {
+		assert(DirectoryEntry.sizeof == 32);
+	}
 }
