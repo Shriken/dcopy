@@ -105,11 +105,12 @@ struct Cluster {
 	} body {
 		// locate the value
 		auto valueStart = (id * 3) / 2; // byte offset
-		auto startingSector = 33 + (valueStart >> 9) - 2;
+		SectorId startingSector = cast(SectorId)(33 + (valueStart >> 9) - 2);
 		auto indexInSector = valueStart & 0x1f;
 
 		auto odd = id % 2 == 1;
 		ubyte firstHalf, secondHalf;
+		// first half
 		auto firstSector = image.readSector(cast(ushort)startingSector);
 		if (odd) {
 			firstHalf = ((value & 0xf) << 4) |
@@ -118,17 +119,28 @@ struct Cluster {
 			firstHalf = value & 0xff;
 		}
 
+		// second half
 		ubyte secondByte;
-		if (indexInSector + 1 == firstSector.length) {
-			secondByte = image
-				.readSector(cast(ushort)(startingSector + 1))[0];
+		auto onTheEdge = indexInSector + 1 == firstSector.length;
+		ubyte[] secondSector;
+		if (onTheEdge) {
+			secondSector = image.readSector(cast(ushort)(startingSector + 1));
+			secondByte = secondSector[0];
 		} else {
 			secondByte = firstSector[indexInSector + 1];
 		}
 		secondHalf = odd ? (value & 0xff0 >> 4)
 			: ((secondByte & 0xf0) | (value >> 8));
 
-		auto secondSector = image.readSector(cast(ushort)startingSector);
+		// store
+		firstSector[indexInSector] = firstHalf;
+		if (onTheEdge) {
+			secondSector[0] = secondHalf;
+			image.writeSector(cast(SectorId)(startingSector + 1), secondSector);
+		} else {
+			firstSector[indexInSector + 1] = secondHalf;
+		}
+		image.writeSector(startingSector, firstSector);
 	}
 }
 
