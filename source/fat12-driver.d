@@ -7,9 +7,12 @@ import util;
 
 alias ClusterId = ushort;
 alias SectorId = ushort;
-bool isLastCluster(ClusterId cluster) {
-	return 0xff8 <= cluster && cluster <= 0xfff;
-}
+bool isFree(ClusterId val) { return val == 0; }
+bool isReserved(ClusterId val) { return 0xff0 <= val && val <= 0xff6; }
+bool isBad(ClusterId val) { return val == 0xff7; }
+bool isLast(ClusterId val) { return 0xff8 <= val && val <= 0xfff; }
+static ClusterId MIN_CLUSTER_ID = 2;
+static ClusterId MAX_CLUSTER_ID = 0xb20;
 
 static SectorId BOOT_SECTOR = 0;
 static SectorId FAT1_SECTOR, FAT2_SECTOR, ROOT_DIR_SECTOR;
@@ -25,6 +28,16 @@ struct Fat12 {
 	this(File f) {
 		image = new Image(f);
 	}
+
+	Cluster getFreeCluster() {
+		foreach (clusterNum; MIN_CLUSTER_ID .. MAX_CLUSTER_ID) {
+			auto value = image.readFatValue(clusterNum);
+			if (value.isFree) {
+				return new Cluster(clusterNum, image);
+			}
+		}
+		return null;
+	}
 }
 
 class Image {
@@ -34,6 +47,75 @@ class Image {
 	this(File f) {
 		file = f;
 		config = ImageConfig(f);
+	}
+
+	ClusterId readFatValue(ClusterId clusterNum) {
+		// locate the value
+		auto valueStart = (clusterNum * 3) / 2; // byte offset
+		auto startingSector = 33 + (valueStart >> 9) - 2;
+		auto indexInSector = valueStart % 512;
+
+		// get first and second bytes
+		ubyte firstHalf, secondHalf;
+		auto bytes = readSector(cast(ushort)startingSector);
+		firstHalf = bytes[indexInSector];
+		if (indexInSector == 511) {
+			bytes = readSector(cast(ushort)(startingSector + 1));
+			secondHalf = bytes[0];
+		} else {
+			secondHalf = bytes[indexInSector + 1];
+		}
+
+		auto odd = clusterNum % 2 == 1;
+		if (odd) {
+			return ((firstHalf & 0xf0) << 8) | secondHalf;
+		} else {
+			return (firstHalf << 4) | (secondHalf & 0xff);
+		}
+	}
+
+	void writeFatValue(ClusterId id, ClusterId value)
+	in {
+		assert(value <= 0xfff);
+	} body {
+		// locate the value
+		auto valueStart = (id * 3) / 2; // byte offset
+		SectorId startingSector = cast(SectorId)(33 + (valueStart >> 9) - 2);
+		auto indexInSector = valueStart & 0x1f;
+
+		auto odd = id % 2 == 1;
+		ubyte firstHalf, secondHalf;
+		// first half
+		auto firstSector = readSector(cast(ushort)startingSector);
+		if (odd) {
+			firstHalf = ((value & 0xf) << 4) |
+				(firstSector[indexInSector] & 0xf);
+		} else {
+			firstHalf = value & 0xff;
+		}
+
+		// second half
+		ubyte secondByte;
+		auto onTheEdge = indexInSector + 1 == firstSector.length;
+		ubyte[] secondSector;
+		if (onTheEdge) {
+			secondSector = readSector(cast(ushort)(startingSector + 1));
+			secondByte = secondSector[0];
+		} else {
+			secondByte = firstSector[indexInSector + 1];
+		}
+		secondHalf = odd ? (value & 0xff0 >> 4)
+			: ((secondByte & 0xf0) | (value >> 8));
+
+		// store
+		firstSector[indexInSector] = firstHalf;
+		if (onTheEdge) {
+			secondSector[0] = secondHalf;
+			writeSector(cast(SectorId)(startingSector + 1), secondSector);
+		} else {
+			firstSector[indexInSector + 1] = secondHalf;
+		}
+		writeSector(startingSector, firstSector);
 	}
 
 	ubyte[] readSector(SectorId sectorNum) {
@@ -54,7 +136,7 @@ class Image {
 	}
 }
 
-struct Cluster {
+class Cluster {
 	ClusterId id;
 	ClusterId value;
 	ubyte[512] data;
@@ -65,82 +147,13 @@ struct Cluster {
 	this(ClusterId id, Image image) {
 		this.image = image;
 		this.id = id;
-		this.value = readFatValue(id);
+		this.value = image.readFatValue(id);
 		this.data = image.readSector(cast(ushort)(id + 33 - 2));
 	}
 
 	~this() {
-		writeFatValue(value);
+		image.writeFatValue(id, value);
 		image.writeSector(dataSector, data);
-	}
-
-	private ClusterId readFatValue(ClusterId clusterNum) {
-		// locate the value
-		auto valueStart = (clusterNum * 3) / 2; // byte offset
-		auto startingSector = 33 + (valueStart >> 9) - 2;
-		auto indexInSector = valueStart % 512;
-
-		// get first and second bytes
-		ubyte firstHalf, secondHalf;
-		auto bytes = image.readSector(cast(ushort)startingSector);
-		firstHalf = bytes[indexInSector];
-		if (indexInSector == 511) {
-			bytes = image.readSector(cast(ushort)(startingSector + 1));
-			secondHalf = bytes[0];
-		} else {
-			secondHalf = bytes[indexInSector + 1];
-		}
-
-		auto odd = clusterNum % 2 == 1;
-		if (odd) {
-			return ((firstHalf & 0xf0) << 8) | secondHalf;
-		} else {
-			return (firstHalf << 4) | (secondHalf & 0xff);
-		}
-	}
-
-	private void writeFatValue(ClusterId value)
-	in {
-		assert(value <= 0xfff);
-	} body {
-		// locate the value
-		auto valueStart = (id * 3) / 2; // byte offset
-		SectorId startingSector = cast(SectorId)(33 + (valueStart >> 9) - 2);
-		auto indexInSector = valueStart & 0x1f;
-
-		auto odd = id % 2 == 1;
-		ubyte firstHalf, secondHalf;
-		// first half
-		auto firstSector = image.readSector(cast(ushort)startingSector);
-		if (odd) {
-			firstHalf = ((value & 0xf) << 4) |
-				(firstSector[indexInSector] & 0xf);
-		} else {
-			firstHalf = value & 0xff;
-		}
-
-		// second half
-		ubyte secondByte;
-		auto onTheEdge = indexInSector + 1 == firstSector.length;
-		ubyte[] secondSector;
-		if (onTheEdge) {
-			secondSector = image.readSector(cast(ushort)(startingSector + 1));
-			secondByte = secondSector[0];
-		} else {
-			secondByte = firstSector[indexInSector + 1];
-		}
-		secondHalf = odd ? (value & 0xff0 >> 4)
-			: ((secondByte & 0xf0) | (value >> 8));
-
-		// store
-		firstSector[indexInSector] = firstHalf;
-		if (onTheEdge) {
-			secondSector[0] = secondHalf;
-			image.writeSector(cast(SectorId)(startingSector + 1), secondSector);
-		} else {
-			firstSector[indexInSector + 1] = secondHalf;
-		}
-		image.writeSector(startingSector, firstSector);
 	}
 }
 
