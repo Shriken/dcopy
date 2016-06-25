@@ -1,3 +1,5 @@
+import std.algorithm.iteration;
+import std.file;
 import std.getopt;
 import std.stdio;
 import std.typecons;
@@ -31,8 +33,11 @@ int main(string[] args) {
 		return 1;
 	}
 
-	auto path = args.popFront().formatFilename();
-	auto fat = Fat12(target);
+	auto path = args.popFront();
+	auto image = new Image(target);
+	auto file = new Fat12File(path, image);
+	source.byChunk(image.config.bytesPerSector)
+		.each!(c => file.append(c));
 
 	return 0;
 }

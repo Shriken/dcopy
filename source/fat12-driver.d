@@ -1,5 +1,6 @@
 module fat12_driver;
 
+import std.algorithm.comparison;
 import std.algorithm.mutation;
 import std.array;
 import std.stdio;
@@ -26,14 +27,6 @@ static this() {
 	DATA_START_SECTOR = cast(ushort)(ROOT_DIR_START_SECTOR + 14);
 }
 
-struct Fat12 {
-	Image image;
-
-	this(File f) {
-		image = new Image(f);
-	}
-}
-
 class Fat12File {
 	FileConfig config;
 	ushort entryNum;
@@ -43,38 +36,89 @@ class Fat12File {
 		return image.config.bytesPerSector / FileConfig.sizeof;
 	}
 
+	@property private Cluster lastCluster() {
+		if (config.firstLogicalCluster.isFree) {
+			config.firstLogicalCluster = image.getFreeCluster();
+		}
+
+		auto cluster = Cluster(config.firstLogicalCluster, image);
+		if (cluster.value.isFree) {
+			cluster.value = 0xfff;
+		}
+		while (!cluster.value.isLast) {
+			cluster = Cluster(cluster.value, image);
+		}
+		return cluster;
+	}
+
 	this(string fn, Image image) {
 		this.image = image;
 
 		fn = formatFilename(fn);
+		assert(fn.length == 11);
 		if (!findFile(fn)) {
 			if (!getEmptyFileEntry()) {
 				throw new Exception("no space on disk");
 			}
 		}
+
+		// TODO(shriken) Set filename.
 	}
 
 	~this() {
+		writeln("saving file...");
 		// save the file config
-		ushort sectorNum = cast(ushort)(entryNum / entriesPerSector);
+		ushort sectorNum = cast(ushort)(
+			ROOT_DIR_START_SECTOR + entryNum / entriesPerSector
+		);
 		auto sector = image.readSector(sectorNum);
 		auto entryIndex = entryNum % entriesPerSector;
 		auto offset = entryIndex * FileConfig.sizeof;
 		config.save(sector[offset .. offset + FileConfig.sizeof]);
 		image.writeSector(sectorNum, sector);
+		writeln("saved.");
+	}
+
+	void append(ubyte[] data) {
+		writeln("appending to file...");
+		auto last = lastCluster;
+
+		// first append to end of last cluster
+		auto bps = image.config.bytesPerSector;
+		auto sizeInLast = config.fileSize % bps;
+		auto count = min(data.length, bps - sizeInLast);
+		last.data[sizeInLast .. sizeInLast + count] = data[0 .. count];
+		data = data[count .. $];
+		if (data.length == 0) {
+			return;
+		}
+
+		// then write to new clusters as needed
+		last.value = image.getFreeCluster();
+		writeln("free cluster gotten, writing");
+		write(data, last.value);
+		config.fileSize = config.fileSize + cast(uint)data.length;
+		writeln("done.");
 	}
 
 	// note: overwrites existing data
 	void write(ubyte[] data) {
-		auto clusterNum = config.firstLogicalCluster;
+		write(data, config.firstLogicalCluster);
+		config.fileSize = cast(uint)data.length;
+	}
+
+	private void write(ubyte[] data, ClusterId start) {
+		writeln("writing to file...");
+		auto nextCluster = start;
 		while (true) {
-			auto cluster = new Cluster(clusterNum, image);
+			writeln("\twriting a sector");
+			auto cluster = Cluster(nextCluster, image);
 			cluster.write(data);
 			if (data.length <= image.config.bytesPerSector) {
 				if (!cluster.value.isFree) {
 					clearChain(cluster.value);
 				}
-				cluster.value = 0xfff;
+				cluster.value = 0xfff; // set end
 				break;
 			}
 			data = data[image.config.bytesPerSector .. $];
@@ -83,11 +127,13 @@ class Fat12File {
 			if (cluster.value.isLast) {
 				cluster.value = image.getFreeCluster();
 			}
+			nextCluster = cluster.value;
 		}
+		writef("written.\n");
 	}
 
-	void clearChain(ClusterId start) {
-		auto cluster = new Cluster(start, image);
+	private void clearChain(ClusterId start) {
+		auto cluster = Cluster(start, image);
 		if (!cluster.value.isFree) {
 			clearChain(cluster.value);
 			cluster.value = 0;
@@ -95,12 +141,14 @@ class Fat12File {
 	}
 
 	private bool getEmptyFileEntry() {
+		writeln("looking for empty file entry...");
 		foreach (sectorId; ROOT_DIR_START_SECTOR .. DATA_START_SECTOR) {
 			auto sector = image.readSector(sectorId);
 			foreach (entryIndex; 0 .. entriesPerSector) {
-				auto byteStart = entryIndex * FileConfig.sizeof;
+				enum FILE_CONFIG_SIZE = 32;
+				auto byteStart = entryIndex * FILE_CONFIG_SIZE;
 				auto entryBytes = sector[
-					byteStart .. byteStart + FileConfig.sizeof
+					byteStart .. byteStart + FILE_CONFIG_SIZE
 				];
 				auto file = FileConfig(entryBytes);
 				if (file.isFree) {
@@ -108,23 +156,28 @@ class Fat12File {
 					entryNum = cast(ushort)(
 						entryIndex + sectorId * entriesPerSector
 					);
+					writeln("found.");
 					return true;
 				}
 			}
 		}
+		writeln("not found.");
 		return false;
 	}
 
 	private bool findFile(string fn) {
+		writefln("looking for file %s...", fn);
 		foreach (sectorId; ROOT_DIR_START_SECTOR .. DATA_START_SECTOR) {
 			auto sector = image.readSector(sectorId);
 			foreach (entryIndex; 0 .. entriesPerSector) {
-				auto byteStart = entryIndex * FileConfig.sizeof;
+				enum FILE_CONFIG_SIZE = 32;
+				auto byteStart = entryIndex * FILE_CONFIG_SIZE;
 				auto entryBytes = sector[
-					byteStart .. byteStart + FileConfig.sizeof
+					byteStart .. byteStart + FILE_CONFIG_SIZE
 				];
 				auto file = FileConfig(entryBytes);
 				if (file.restAreFree) {
+					writeln("not found.");
 					return false;
 				} else if (file.isFree) {
 					continue;
@@ -136,10 +189,12 @@ class Fat12File {
 					entryNum = cast(ushort)(
 						entryIndex + sectorId * entriesPerSector
 					);
+					writeln("found.");
 					return true;
 				}
 			}
 		}
+		writeln("not found.");
 		return false;
 	}
 }
@@ -154,9 +209,11 @@ class Image {
 	}
 
 	ClusterId getFreeCluster() {
+		writeln("getting free cluster...");
 		foreach (clusterNum; MIN_CLUSTER_ID .. MAX_CLUSTER_ID) {
 			auto value = readFatValue(clusterNum);
 			if (value.isFree) {
+				scope(exit) writeln("gotten.");
 				return clusterNum;
 			}
 		}
@@ -250,7 +307,7 @@ class Image {
 	}
 }
 
-class Cluster {
+struct Cluster {
 	ClusterId id;
 	ClusterId value;
 	ubyte[512] data;
@@ -341,10 +398,10 @@ struct FileConfig {
 	@property const ushort IGNORE_IN_FAT12() { return data.getWordAt(20); }
 	@property const ushort lastWirteTime() { return data.getWordAt(22); }
 	@property const ushort lastWriteDate() { return data.getWordAt(24); }
-	@property const ushort firstLogicalCluster() {
-		return data.getWordAt(26);
-	}
+	@property const ushort firstLogicalCluster() { return data.getWordAt(26); }
+	@property ushort firstLogicalCluster(ushort x) { return data.setWordAt(26, x); }
 	@property const uint fileSize() { return data.getDoubleAt(28); } // in bytes
+	@property uint fileSize(uint x) { return data.setDoubleAt(28, x); }
 
 	@property const bool isFree() {
 		return filename[0] == FREE_BYTE
@@ -364,10 +421,6 @@ struct FileConfig {
 	void save(ubyte[] dest) {
 		copy(dest, data);
 	}
-
-	unittest {
-		assert(DirectoryEntry.sizeof == 32);
-	}
 }
 
 private ushort getWordAt(const ubyte[] data, size_t index) {
@@ -381,4 +434,18 @@ private uint getDoubleAt(const ubyte[] data, size_t index) {
 		data[index + 2] << 16 +
 		data[index + 3] << 24
 	);
+}
+
+private ushort setWordAt(ubyte[] data, size_t index, ushort val) {
+	data[index] = val & 0xff;
+	data[index + 1] = (val >> 8) & 0xff;
+	return val;
+}
+
+private uint setDoubleAt(ubyte[] data, size_t index, uint val) {
+	data[index] = val & 0xff;
+	data[index + 1] = (val >> 8) & 0xff;
+	data[index + 2] = (val >> 16) & 0xff;
+	data[index + 3] = (val >> 24) & 0xff;
+	return val;
 }
