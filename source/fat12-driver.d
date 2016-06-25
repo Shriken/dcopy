@@ -15,11 +15,14 @@ static ClusterId MIN_CLUSTER_ID = 2;
 static ClusterId MAX_CLUSTER_ID = 0xb20;
 
 static SectorId BOOT_SECTOR = 0;
-static SectorId FAT1_SECTOR, FAT2_SECTOR, ROOT_DIR_SECTOR;
+static SectorId FAT1_START_SECTOR, FAT2_START_SECTOR;
+static SectorId ROOT_DIR_START_SECTOR;
+static SectorId DATA_START_SECTOR;
 static this() {
-	FAT1_SECTOR = cast(ushort)(BOOT_SECTOR + 1);
-	FAT2_SECTOR = cast(ushort)(FAT1_SECTOR + 9);
-	ROOT_DIR_SECTOR = cast(ushort)(FAT2_SECTOR + 9);
+	FAT1_START_SECTOR = cast(ushort)(BOOT_SECTOR + 1);
+	FAT2_START_SECTOR = cast(ushort)(FAT1_START_SECTOR + 9);
+	ROOT_DIR_START_SECTOR = cast(ushort)(FAT2_START_SECTOR + 9);
+	DATA_START_SECTOR = cast(ushort)(ROOT_DIR_START_SECTOR + 14);
 }
 
 struct Fat12 {
@@ -136,6 +139,86 @@ class Image {
 	}
 }
 
+class Fat12File {
+	FileConfig config;
+	ushort entryNum;
+
+	private Image image;
+	@property ushort entriesPerSector() {
+		return image.config.bytesPerSector / FileConfig.sizeof;
+	}
+
+	this(string fn, Image image) {
+		this.image = image;
+
+		fn = formatFilename(fn);
+		if (!findFile(fn)) {
+			if (!getEmptyFileEntry()) {
+				throw new Exception("no space on disk");
+			}
+		}
+	}
+
+	~this() {
+		// save the file config
+		ushort sectorNum = cast(ushort)(entryNum / entriesPerSector);
+		auto sector = image.readSector(sectorNum);
+		auto entryIndex = entryNum % entriesPerSector;
+		auto offset = entryIndex * FileConfig.sizeof;
+		config.save(sector[offset .. offset + FileConfig.sizeof]);
+		image.writeSector(sectorNum, sector);
+	}
+
+	private bool getEmptyFileEntry() {
+		foreach (sectorId; ROOT_DIR_START_SECTOR .. DATA_START_SECTOR) {
+			auto sector = image.readSector(sectorId);
+			foreach (entryIndex; 0 .. entriesPerSector) {
+				auto byteStart = entryIndex * FileConfig.sizeof;
+				auto entryBytes = sector[
+					byteStart .. byteStart + FileConfig.sizeof
+				];
+				auto file = FileConfig(entryBytes);
+				if (file.isFree) {
+					config = file;
+					entryNum = cast(ushort)(
+						entryIndex + sectorId * entriesPerSector
+					);
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	private bool findFile(string fn) {
+		foreach (sectorId; ROOT_DIR_START_SECTOR .. DATA_START_SECTOR) {
+			auto sector = image.readSector(sectorId);
+			foreach (entryIndex; 0 .. entriesPerSector) {
+				auto byteStart = entryIndex * FileConfig.sizeof;
+				auto entryBytes = sector[
+					byteStart .. byteStart + FileConfig.sizeof
+				];
+				auto file = FileConfig(entryBytes);
+				if (file.restAreFree) {
+					return false;
+				} else if (file.isFree) {
+					continue;
+				} else if (
+					file.filename == fn[0 .. 8]
+					&& file.extension == fn [9 .. 12]
+				) {
+					config = file;
+					entryNum = cast(ushort)(
+						entryIndex + sectorId * entriesPerSector
+					);
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+}
+
 class Cluster {
 	ClusterId id;
 	ClusterId value;
@@ -203,86 +286,58 @@ struct ImageConfig {
 	}
 }
 
-private ushort getWordAt(ubyte[] data, size_t index) {
+struct FileConfig {
+	static ubyte FREE_BYTE = 0xe5;
+	static ubyte REST_ARE_FREE_BYTE = 0;
+
+	@property const ubyte[8] filename() { return data[0..8]; }
+	@property const ubyte[3] extension() { return data[8..11]; }
+	@property const ubyte attributes() { return data[11]; }
+	@property const ushort reserved() { return data.getWordAt(12); }
+	@property const ushort creationTime() { return data.getWordAt(14); }
+	@property const ushort creationDate() { return data.getWordAt(16); }
+	@property const ushort lastAccessDate() { return data.getWordAt(18); }
+	@property const ushort IGNORE_IN_FAT12() { return data.getWordAt(20); }
+	@property const ushort lastWirteTime() { return data.getWordAt(22); }
+	@property const ushort lastWriteDate() { return data.getWordAt(24); }
+	@property const ushort firstLogicalCluster() {
+		return data.getWordAt(26);
+	}
+	@property const uint fileSize() { return data.getDoubleAt(28); } // in bytes
+
+	@property const bool isFree() {
+		return filename[0] == FREE_BYTE
+			|| filename[0] == REST_ARE_FREE_BYTE;
+	}
+
+	@property const bool restAreFree() {
+		return filename[0] == REST_ARE_FREE_BYTE;
+	}
+
+	private ubyte[] data;
+
+	this(ubyte[] data) {
+		this.data = data[0..32].dup();
+	}
+
+	void save(ubyte[] dest) {
+		copy(dest, data);
+	}
+
+	unittest {
+		assert(DirectoryEntry.sizeof == 32);
+	}
+}
+
+private ushort getWordAt(const ubyte[] data, size_t index) {
 	return cast(ushort)(data[index + 1] << 8 + data[index]);
 }
 
-private uint getDoubleAt(ubyte[] data, size_t index) {
+private uint getDoubleAt(const ubyte[] data, size_t index) {
 	return cast(uint)(
 		data[index] +
 		data[index + 1] << 8 +
 		data[index + 2] << 16 +
 		data[index + 3] << 24
 	);
-}
-
-struct DirectoryEntry {
-	static ubyte FREE_BYTE = 0xe5;
-	static ubyte REST_ARE_FREE_BYTE = 0;
-
-	ubyte[8] filename;
-	ubyte[3] extension;
-	ubyte attributes;
-	ushort reserved;
-	ushort creationTime;
-	ushort creationDate;
-	ushort lastAccessDate;
-	ushort IGNORE_IN_FAT12;
-	ushort lastWirteTime;
-	ushort lastWriteDate;
-	ushort firstLogicalCluster;
-	uint fileSize; // in bytes
-
-	@property const bool isFree() {
-		return filename[0] == FREE_BYTE || filename[0] == REST_ARE_FREE_BYTE;
-	}
-
-	@property const bool restAreFree() {
-		return filename[0] == 0;
-	}
-
-	this(ubyte[] data) {
-		copy(filename, data[0..8]);
-		copy(extension, data[8..11]);
-		attributes = data[11];
-		reserved = data.getWordAt(12);
-		creationTime = data.getWordAt(14);
-		creationDate = data.getWordAt(16);
-		lastAccessDate = data.getWordAt(18);
-		IGNORE_IN_FAT12 = data.getWordAt(20);
-		lastWirteTime = data.getWordAt(22);
-		lastWriteDate = data.getWordAt(24);
-		firstLogicalCluster = data.getWordAt(26);
-		fileSize = data.getDoubleAt(28); // in bytes
-	}
-
-	/+
-	/// returns the directory entry of a file with matching filename
-	/// note: doesn't support directories
-	DirectoryEntry fileEntry(string fn)
-	out (entry) {
-		assert(!entry.isFree);
-		assert(!entry.restAreFree);
-	} body {
-		seekSector(ROOT_DIR_SECTOR);
-		auto entryBytes = new ubyte[DirectoryEntry.sizeof];
-		while (true) {
-			auto entry = DirectoryEntry(file.rawRead(entryBytes));
-			if (entry.restAreFree) {
-				break;
-			} else if (entry.isFree) {
-				continue;
-			}
-
-			if (entry.filename == fn) {
-				return entry;
-			}
-		}
-		throw new Exception("file %s not found", fn);
-	}
-	+/
-
-	unittest {
-		assert(DirectoryEntry.sizeof == 32);
-	}
 }
