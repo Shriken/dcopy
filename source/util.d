@@ -33,8 +33,14 @@ string formatFilename(string fn) {
 			~ ret[$-3..$];
 	}
 
-	if (fn != ret) {
-		stderr.writefln("warning: changed fn \"%s\" to \"%s\"", fn, ret);
+	debug {
+		if (fn != ret) {
+			stderr.writefln(
+				"warning: changed fn \"%s\" to \"%s\"",
+				fn,
+				ret
+			);
+		}
 	}
 
 	return ret;
