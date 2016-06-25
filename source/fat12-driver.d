@@ -1,6 +1,7 @@
 module fat12_driver;
 
 import std.algorithm.mutation;
+import std.array;
 import std.stdio;
 
 import util;
@@ -31,15 +32,115 @@ struct Fat12 {
 	this(File f) {
 		image = new Image(f);
 	}
+}
 
-	Cluster getFreeCluster() {
-		foreach (clusterNum; MIN_CLUSTER_ID .. MAX_CLUSTER_ID) {
-			auto value = image.readFatValue(clusterNum);
-			if (value.isFree) {
-				return new Cluster(clusterNum, image);
+class Fat12File {
+	FileConfig config;
+	ushort entryNum;
+
+	private Image image;
+	@property ushort entriesPerSector() {
+		return image.config.bytesPerSector / FileConfig.sizeof;
+	}
+
+	this(string fn, Image image) {
+		this.image = image;
+
+		fn = formatFilename(fn);
+		if (!findFile(fn)) {
+			if (!getEmptyFileEntry()) {
+				throw new Exception("no space on disk");
 			}
 		}
-		return null;
+	}
+
+	~this() {
+		// save the file config
+		ushort sectorNum = cast(ushort)(entryNum / entriesPerSector);
+		auto sector = image.readSector(sectorNum);
+		auto entryIndex = entryNum % entriesPerSector;
+		auto offset = entryIndex * FileConfig.sizeof;
+		config.save(sector[offset .. offset + FileConfig.sizeof]);
+		image.writeSector(sectorNum, sector);
+	}
+
+	// note: overwrites existing data
+	void write(ubyte[] data) {
+		auto clusterNum = config.firstLogicalCluster;
+		while (true) {
+			auto cluster = new Cluster(clusterNum, image);
+			cluster.write(data);
+			if (data.length <= image.config.bytesPerSector) {
+				if (!cluster.value.isFree) {
+					clearChain(cluster.value);
+				}
+				cluster.value = 0xfff;
+				break;
+			}
+			data = data[image.config.bytesPerSector .. $];
+
+			// get next cluster
+			if (cluster.value.isLast) {
+				cluster.value = image.getFreeCluster();
+			}
+		}
+	}
+
+	void clearChain(ClusterId start) {
+		auto cluster = new Cluster(start, image);
+		if (!cluster.value.isFree) {
+			clearChain(cluster.value);
+			cluster.value = 0;
+		}
+	}
+
+	private bool getEmptyFileEntry() {
+		foreach (sectorId; ROOT_DIR_START_SECTOR .. DATA_START_SECTOR) {
+			auto sector = image.readSector(sectorId);
+			foreach (entryIndex; 0 .. entriesPerSector) {
+				auto byteStart = entryIndex * FileConfig.sizeof;
+				auto entryBytes = sector[
+					byteStart .. byteStart + FileConfig.sizeof
+				];
+				auto file = FileConfig(entryBytes);
+				if (file.isFree) {
+					config = file;
+					entryNum = cast(ushort)(
+						entryIndex + sectorId * entriesPerSector
+					);
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	private bool findFile(string fn) {
+		foreach (sectorId; ROOT_DIR_START_SECTOR .. DATA_START_SECTOR) {
+			auto sector = image.readSector(sectorId);
+			foreach (entryIndex; 0 .. entriesPerSector) {
+				auto byteStart = entryIndex * FileConfig.sizeof;
+				auto entryBytes = sector[
+					byteStart .. byteStart + FileConfig.sizeof
+				];
+				auto file = FileConfig(entryBytes);
+				if (file.restAreFree) {
+					return false;
+				} else if (file.isFree) {
+					continue;
+				} else if (
+					file.filename == fn[0 .. 8]
+					&& file.extension == fn [9 .. 12]
+				) {
+					config = file;
+					entryNum = cast(ushort)(
+						entryIndex + sectorId * entriesPerSector
+					);
+					return true;
+				}
+			}
+		}
+		return false;
 	}
 }
 
@@ -50,6 +151,16 @@ class Image {
 	this(File f) {
 		file = f;
 		config = ImageConfig(f);
+	}
+
+	ClusterId getFreeCluster() {
+		foreach (clusterNum; MIN_CLUSTER_ID .. MAX_CLUSTER_ID) {
+			auto value = readFatValue(clusterNum);
+			if (value.isFree) {
+				return clusterNum;
+			}
+		}
+		throw new Exception("no free clusters");
 	}
 
 	ClusterId readFatValue(ClusterId clusterNum) {
@@ -139,86 +250,6 @@ class Image {
 	}
 }
 
-class Fat12File {
-	FileConfig config;
-	ushort entryNum;
-
-	private Image image;
-	@property ushort entriesPerSector() {
-		return image.config.bytesPerSector / FileConfig.sizeof;
-	}
-
-	this(string fn, Image image) {
-		this.image = image;
-
-		fn = formatFilename(fn);
-		if (!findFile(fn)) {
-			if (!getEmptyFileEntry()) {
-				throw new Exception("no space on disk");
-			}
-		}
-	}
-
-	~this() {
-		// save the file config
-		ushort sectorNum = cast(ushort)(entryNum / entriesPerSector);
-		auto sector = image.readSector(sectorNum);
-		auto entryIndex = entryNum % entriesPerSector;
-		auto offset = entryIndex * FileConfig.sizeof;
-		config.save(sector[offset .. offset + FileConfig.sizeof]);
-		image.writeSector(sectorNum, sector);
-	}
-
-	private bool getEmptyFileEntry() {
-		foreach (sectorId; ROOT_DIR_START_SECTOR .. DATA_START_SECTOR) {
-			auto sector = image.readSector(sectorId);
-			foreach (entryIndex; 0 .. entriesPerSector) {
-				auto byteStart = entryIndex * FileConfig.sizeof;
-				auto entryBytes = sector[
-					byteStart .. byteStart + FileConfig.sizeof
-				];
-				auto file = FileConfig(entryBytes);
-				if (file.isFree) {
-					config = file;
-					entryNum = cast(ushort)(
-						entryIndex + sectorId * entriesPerSector
-					);
-					return true;
-				}
-			}
-		}
-		return false;
-	}
-
-	private bool findFile(string fn) {
-		foreach (sectorId; ROOT_DIR_START_SECTOR .. DATA_START_SECTOR) {
-			auto sector = image.readSector(sectorId);
-			foreach (entryIndex; 0 .. entriesPerSector) {
-				auto byteStart = entryIndex * FileConfig.sizeof;
-				auto entryBytes = sector[
-					byteStart .. byteStart + FileConfig.sizeof
-				];
-				auto file = FileConfig(entryBytes);
-				if (file.restAreFree) {
-					return false;
-				} else if (file.isFree) {
-					continue;
-				} else if (
-					file.filename == fn[0 .. 8]
-					&& file.extension == fn [9 .. 12]
-				) {
-					config = file;
-					entryNum = cast(ushort)(
-						entryIndex + sectorId * entriesPerSector
-					);
-					return true;
-				}
-			}
-		}
-		return false;
-	}
-}
-
 class Cluster {
 	ClusterId id;
 	ClusterId value;
@@ -237,6 +268,16 @@ class Cluster {
 	~this() {
 		image.writeFatValue(id, value);
 		image.writeSector(dataSector, data);
+	}
+
+	void write(ubyte[] data) {
+		auto bps = image.config.bytesPerSector;
+		if (data.length > bps) {
+			data = data[0 .. bps];
+		} else if (data.length < bps) {
+			data = data ~ replicate([cast(ubyte)0], bps - data.length);
+		}
+		this.data = data.dup;
 	}
 }
 
