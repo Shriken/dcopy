@@ -227,7 +227,7 @@ class Image {
 	ClusterId readFatValue(ClusterId clusterNum) {
 		// locate the value
 		auto valueStart = (clusterNum * 3) / 2; // byte offset
-		auto startingSector = 33 + (valueStart >> 9) - 2;
+		auto startingSector = 1 + valueStart / 512;
 		auto indexInSector = valueStart % 512;
 
 		// get first and second bytes
@@ -255,8 +255,8 @@ class Image {
 	} body {
 		// locate the value
 		auto valueStart = (id * 3) / 2; // byte offset
-		SectorId startingSector = cast(SectorId)(33 + (valueStart >> 9) - 2);
-		auto indexInSector = valueStart & 0x1f;
+		SectorId startingSector = cast(SectorId)(1 + valueStart / 512);
+		auto indexInSector = valueStart % 512;
 
 		auto odd = id % 2 == 1;
 		ubyte firstHalf, secondHalf;
