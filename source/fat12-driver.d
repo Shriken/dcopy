@@ -158,7 +158,7 @@ class Fat12File {
 				if (file.isFree) {
 					config = file;
 					entryNum = cast(ushort)(
-						entryIndex + sectorId * entriesPerSector
+						entryIndex + (sectorId - ROOT_DIR_START_SECTOR) * entriesPerSector
 					);
 					debug writeln("found.");
 					return true;
@@ -323,7 +323,7 @@ struct Cluster {
 		this.image = image;
 		this.id = id;
 		this.value = image.readFatValue(id);
-		this.data = image.readSector(cast(ushort)(id + 33 - 2));
+		this.data = image.readSector(dataSector);
 	}
 
 	~this() {
