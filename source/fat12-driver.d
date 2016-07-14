@@ -36,26 +36,10 @@ class Fat12File {
 		return image.config.bytesPerSector / FileConfig.sizeof;
 	}
 
-	@property private Cluster lastCluster() {
-		if (config.firstLogicalCluster.isFree) {
-			config.firstLogicalCluster = image.getFreeCluster();
-		}
-
-		auto cluster = Cluster(config.firstLogicalCluster, image);
-		if (cluster.value.isFree) {
-			cluster.value = 0xfff;
-		}
-		while (!cluster.value.isLast) {
-			cluster = Cluster(cluster.value, image);
-		}
-		return cluster;
-	}
-
 	this(string fn, Image image) {
 		this.image = image;
 
 		fn = formatFilename(fn);
-		assert(fn.length == 11);
 		if (!findFile(fn)) {
 			if (!getEmptyFileEntry()) {
 				throw new Exception("no space on disk");
@@ -84,23 +68,26 @@ class Fat12File {
 	void append(ubyte[] data) {
 		scope(exit) saveConfig();
 		debug writeln("appending to file...");
-		auto last = lastCluster;
-
-		// first append to end of last cluster
+		auto last = getLastCluster();
+		auto size = config.fileSize;
+		// if size % bytesPerSector is 0, then the last cluster is full
 		auto bps = image.config.bytesPerSector;
-		auto sizeInLast = config.fileSize % bps;
-		auto count = min(data.length, bps - sizeInLast);
-		last.data[sizeInLast .. sizeInLast + count] = data[0 .. count];
-		config.fileSize = config.fileSize + count;
-		data = data[count .. $];
-		if (data.length == 0) {
-			return;
+		auto bytesInLast = size % bps;
+		if (size == 0 || bytesInLast != 0) {
+			auto bytesToPut = min(bps - bytesInLast, data.length);
+			copy(
+				data[0 .. bytesToPut],
+				last.data[bytesInLast .. bytesInLast + bytesToPut]
+			);
+			data = data[bytesToPut .. $];
+			config.fileSize = cast(uint)(config.fileSize + bytesToPut);
 		}
 
-		// then write to new clusters as needed
-		last.value = image.getFreeCluster();
-		debug writeln("free cluster gotten, writing");
-		write(data, last.value);
+		if (data.length > 0) {
+			last.value = image.getFreeCluster();
+			write(data, last.value);
+		}
+		last.save();
 		debug writeln("done.");
 	}
 
@@ -133,7 +120,29 @@ class Fat12File {
 			}
 			nextCluster = cluster.value;
 		}
-		writef("written.\n");
+		debug writeln("written.");
+	}
+
+	private Cluster getLastCluster() {
+		debug writeln("getting last cluster...");
+		debug scope (exit) writeln("gotten.");
+		if (config.firstLogicalCluster.isFree) {
+			config.firstLogicalCluster = image.getFreeCluster();
+			auto cluster = Cluster(config.firstLogicalCluster, image);
+			cluster.value = 0xfff;
+		}
+
+		auto cid = config.firstLogicalCluster;
+		while (true) {
+			auto cluster = Cluster(cid, image);
+			if (cluster.value.isFree) {
+				cluster.value = 0xfff;
+			}
+			if (cluster.value.isLast) {
+				return cluster;
+			}
+			cid = cluster.value;
+		}
 	}
 
 	private void clearChain(ClusterId start) {
@@ -142,6 +151,40 @@ class Fat12File {
 			clearChain(cluster.value);
 			cluster.value = 0;
 		}
+	}
+
+	private bool findFile(string fn) {
+		debug writefln("looking for file %s...", fn);
+		foreach (sectorId; ROOT_DIR_START_SECTOR .. DATA_START_SECTOR) {
+			auto sector = image.readSector(sectorId);
+			foreach (entryIndex; 0 .. entriesPerSector) {
+				enum FILE_CONFIG_SIZE = 32;
+				auto byteStart = entryIndex * FILE_CONFIG_SIZE;
+				auto entryBytes = sector[
+					byteStart .. byteStart + FILE_CONFIG_SIZE
+				];
+				auto file = FileConfig(entryBytes);
+				if (file.isFree) {
+					if (file.restAreFree) {
+						debug writeln("not found.");
+						return false;
+					}
+					continue;
+				} else if (
+					file.filename == fn[0 .. 8]
+					&& file.extension == fn [9 .. 12]
+				) {
+					config = file;
+					entryNum = cast(ushort)(
+						sectorId * entriesPerSector + entryIndex
+					);
+					debug writeln("found.");
+					return true;
+				}
+			}
+		}
+		debug writeln("not found.");
+		return false;
 	}
 
 	private bool getEmptyFileEntry() {
@@ -168,39 +211,6 @@ class Fat12File {
 		debug writeln("not found.");
 		return false;
 	}
-
-	private bool findFile(string fn) {
-		debug writefln("looking for file %s...", fn);
-		foreach (sectorId; ROOT_DIR_START_SECTOR .. DATA_START_SECTOR) {
-			auto sector = image.readSector(sectorId);
-			foreach (entryIndex; 0 .. entriesPerSector) {
-				enum FILE_CONFIG_SIZE = 32;
-				auto byteStart = entryIndex * FILE_CONFIG_SIZE;
-				auto entryBytes = sector[
-					byteStart .. byteStart + FILE_CONFIG_SIZE
-				];
-				auto file = FileConfig(entryBytes);
-				if (file.restAreFree) {
-					debug writeln("not found.");
-					return false;
-				} else if (file.isFree) {
-					continue;
-				} else if (
-					file.filename == fn[0 .. 8]
-					&& file.extension == fn [9 .. 12]
-				) {
-					config = file;
-					entryNum = cast(ushort)(
-						entryIndex + sectorId * entriesPerSector
-					);
-					debug writeln("found.");
-					return true;
-				}
-			}
-		}
-		debug writeln("not found.");
-		return false;
-	}
 }
 
 class Image {
@@ -214,38 +224,35 @@ class Image {
 
 	ClusterId getFreeCluster() {
 		debug writeln("getting free cluster...");
+		debug scope(exit) writeln("gotten.");
 		foreach (clusterNum; MIN_CLUSTER_ID .. MAX_CLUSTER_ID) {
 			auto value = readFatValue(clusterNum);
 			if (value.isFree) {
-				debug scope(exit) writeln("gotten.");
 				return clusterNum;
 			}
 		}
 		throw new Exception("no free clusters");
 	}
 
-	ClusterId readFatValue(ClusterId clusterNum) {
+	ClusterId readFatValue(ClusterId clusterNum)
+	out(val) {
+		assert(val <= 0xfff);
+	} body {
 		// locate the value
 		auto valueStart = (clusterNum * 3) / 2; // byte offset
 		auto startingSector = 1 + valueStart / 512;
 		auto indexInSector = valueStart % 512;
 
 		// get first and second bytes
-		ubyte firstHalf, secondHalf;
-		auto bytes = readSector(cast(ushort)startingSector);
-		firstHalf = bytes[indexInSector];
-		if (indexInSector == 511) {
-			bytes = readSector(cast(ushort)(startingSector + 1));
-			secondHalf = bytes[0];
-		} else {
-			secondHalf = bytes[indexInSector + 1];
-		}
+		auto bytes = readSector(cast(ushort)startingSector) ~
+			readSector(cast(ushort)(startingSector + 1));
+		auto word = bytes.getWordAt(indexInSector);
 
 		auto odd = clusterNum % 2 == 1;
 		if (odd) {
-			return ((firstHalf & 0xf0) << 8) | secondHalf;
+			return word >> 4;
 		} else {
-			return (firstHalf << 4) | (secondHalf & 0xff);
+			return word & 0xfff;
 		}
 	}
 
@@ -255,42 +262,25 @@ class Image {
 	} body {
 		// locate the value
 		auto valueStart = (id * 3) / 2; // byte offset
-		SectorId startingSector = cast(SectorId)(1 + valueStart / 512);
+		auto startingSector = cast(ushort)(1 + valueStart / 512);
 		auto indexInSector = valueStart % 512;
 
+		auto bytes = readSector(startingSector) ~
+			readSector(cast(ushort)(startingSector + 1));
+		auto word = bytes.getWordAt(indexInSector);
 		auto odd = id % 2 == 1;
-		ubyte firstHalf, secondHalf;
-		// first half
-		auto firstSector = readSector(cast(ushort)startingSector);
 		if (odd) {
-			firstHalf = ((value & 0xf) << 4) |
-				(firstSector[indexInSector] & 0xf);
+			word = cast(ushort)(value << 4) | (word & 0x000f);
 		} else {
-			firstHalf = value & 0xff;
+			word = value | (word & 0xf000);
 		}
-
-		// second half
-		ubyte secondByte;
-		auto onTheEdge = indexInSector + 1 == firstSector.length;
-		ubyte[] secondSector;
-		if (onTheEdge) {
-			secondSector = readSector(cast(ushort)(startingSector + 1));
-			secondByte = secondSector[0];
-		} else {
-			secondByte = firstSector[indexInSector + 1];
-		}
-		secondHalf = odd ? (value & 0xff0 >> 4)
-			: ((secondByte & 0xf0) | (value >> 8));
+		bytes.setWordAt(indexInSector, word);
 
 		// store
-		firstSector[indexInSector] = firstHalf;
-		if (onTheEdge) {
-			secondSector[0] = secondHalf;
-			writeSector(cast(SectorId)(startingSector + 1), secondSector);
-		} else {
-			firstSector[indexInSector + 1] = secondHalf;
+		writeSector(startingSector, bytes[0 .. 512]);
+		if (indexInSector == 511) {
+			writeSector(cast(ushort)(startingSector + 1), bytes[512 .. $]);
 		}
-		writeSector(startingSector, firstSector);
 	}
 
 	ubyte[] readSector(SectorId sectorNum) {
@@ -327,6 +317,10 @@ struct Cluster {
 	}
 
 	~this() {
+		save();
+	}
+
+	void save() {
 		image.writeFatValue(id, value);
 		image.writeSector(dataSector, data);
 	}

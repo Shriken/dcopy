@@ -13,7 +13,10 @@ T popFront(T)(ref T[] arr) {
 // format a filename to fat12
 // trim the name if it's too long
 // extend it with spaces if it's too short
-string formatFilename(string fn) {
+string formatFilename(string fn)
+out(ret) {
+	assert(ret.length == 11);
+} body {
 	string ret = fn;
 	auto index = ret.lastIndexOf('.');
 	if (index != ret.length - 3) {
