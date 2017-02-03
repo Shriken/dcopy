@@ -68,6 +68,7 @@ class Fat12File {
 	void append(ubyte[] data) {
 		scope(exit) saveConfig();
 		debug writeln("appending to file...");
+
 		auto last = getLastCluster();
 		auto size = config.fileSize;
 		// if size % bytesPerSector is 0, then the last cluster is full
@@ -86,8 +87,10 @@ class Fat12File {
 		if (data.length > 0) {
 			last.value = image.getFreeCluster();
 			write(data, last.value);
+			config.fileSize = cast(uint)(config.fileSize + data.length);
 		}
 		last.save();
+
 		debug writeln("done.");
 	}
 
